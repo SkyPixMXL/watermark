@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Export MP4 (ffmpeg.wasm single-thread) — Bande 8%</title>
+<style>
+  body { font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; margin:0; background:#f2f2f5; }
+  .wrap { max-width:980px; margin:18px auto; padding:12px; }
+  header { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
+  .grid { display:flex; flex-direction:column; gap:18px; }
+  .media-card { background:white; border-radius:12px; padding:12px; box-shadow:0 6px 18px rgba(0,0,0,0.06); }
+  .media-inner { display:flex; gap:12px; align-items:flex-start; flex-wrap:wrap; }
+  .media-inner > * { width:48%; max-width:48%; border-radius:8px; overflow:hidden; background:#000; }
+  img, video, canvas { display:block; width:100%; height:auto; }
+  .meta { margin-top:10px; display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+  button { background:#007aff; color:white; border:0; padding:8px 10px; border-radius:8px; cursor:pointer; }
+  button:disabled { background:#999; cursor:default; }
+  .status { font-size:0.9rem; color:#333; }
+  .progress { width:100%; background:#eee; height:8px; border-radius:6px; overflow:hidden; margin-top:8px; }
+  .progress > i { display:block; height:100%; width:0%; background:#007aff; transition:width .2s linear; }
+  .small { font-size:0.85rem; color:#555; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <input id="fileInput" type="file" accept="image/*,video/*" multiple>
+    <button id="clearBtn">Effacer</button>
+    <div id="globalStatus" class="status" style="margin-left:auto"></div>
+  </header>
+
+  <section id="preview" class="grid"></section>
+</div>
+
+<!-- On force le JS core (single-thread friendly). Si ton serveur bloque le CDN, remplace par ton chemin -->
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+
+<script>
+(async ()=> {
+  const { createFFmpeg, fetchFile } = FFmpeg;
+
+  // IMPORTANT: on essaye de forcer le JS core (non SharedArrayBuffer) en donnant corePath.
+  // Cela tend à fonctionner sans SharedArrayBuffer sur iOS, mais peut être très lent.
+  const coreJsUrl = 'https://unpkg.com/@ffmpeg/core@0.11.6/dist/ffmpeg-core.js';
+  const ffmpeg = createFFmpeg({ corePath: coreJsUrl, log: false }); // single-thread friendly fallback
+
+  let ffmpegLoaded = false;
+
+  const input = document.getElementById('fileInput');
+  const preview = document.getElementById('preview');
+  const clearBtn = document.getElementById('clearBtn');
+  const globalStatus = document.getElementById('globalStatus');
+
+  function setGlobalStatus(txt){ globalStatus.textContent = txt || ''; }
+  function humanFileSize(bytes){
+    const thresh = 1024;
+    if(bytes < thresh) return bytes + ' B';
+    const units = ['KB','MB','GB']; let u=-1;
+    do { bytes /= thresh; ++u; } while(bytes >= thresh && u < units.length-1);
+    return bytes.toFixed(1)+' '+units[u];
+  }
+  function escapeHtml(s){ return (s+'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+  function createCard(file, idx){
+    const url = URL.createObjectURL(file);
+    const isVideo = file.type.startsWith('video/');
+    const card = document.createElement('article'); card.className = 'media-card';
+    const inner = document.createElement('div'); inner.className = 'media-inner';
+
+    // Left: original
+    let orig;
+    if(isVideo){
+      orig = document.createElement('video');
+      orig.src = url;
+      orig.controls = true;
+      orig.playsInline = true;
+      orig.muted = true;
+      orig.autoplay = true;
+      orig.loop = true;
+    } else {
+      orig = document.createElement('img');
+      orig.src = url;
+      orig.alt = file.name;
+    }
+    inner.appendChild(orig);
+
+    // Right: canvas preview
+    const canvas = document.createElement('canvas');
+    inner.appendChild(canvas);
+    card.appendChild(inner);
+
+    // Meta + actions
+    const meta = document.createElement('div'); meta.className = 'meta';
+    const left = document.createElement('div');
+    left.innerHTML = `<div><strong>${escapeHtml(file.name)}</strong></div>
+                      <div class="small">${file.type} • ${humanFileSize(file.size)}</div>`;
+    const actions = document.createElement('div');
+
+    const dlOrig = document.createElement('button');
+    dlOrig.textContent = 'Télécharger original';
+    dlOrig.onclick = ()=> { const a=document.createElement('a'); a.href=url; a.download=file.name; a.click(); };
+    actions.appendChild(dlOrig);
+
+    const dlWithBand = document.createElement('button');
+    dlWithBand.textContent = isVideo ? 'Télécharger MP4 (avec bande)' : 'Télécharger image (avec bande)';
+    dlWithBand.disabled = true;
+    actions.appendChild(dlWithBand);
+
+    meta.appendChild(left); meta.appendChild(actions); card.appendChild(meta);
+
+    // progress UI
+    const progBox = document.createElement('div');
+    progBox.style.marginTop = '8px';
+    progBox.innerHTML = `<div class="status small"></div><div class="progress"><i></i></div>`;
+    card.appendChild(progBox);
+    const statusLine = progBox.querySelector('.status');
+    const progBar = progBox.querySelector('.progress > i');
+
+    // Behavior
+    if(!isVideo){
+      // image -> draw once
+      const img = new Image();
+      img.src = url;
+      img.onload = () => {
+        const band = Math.max(1, Math.round(img.height * 0.08));
+        canvas.width = img.width; canvas.height = img.height + band;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        ctx.fillStyle = 'white';
+        ctx.fillRect(0, img.height, img.width, band);
+        dlWithBand.disabled = false;
+        dlWithBand.onclick = () => {
+          canvas.toBlob(blob => {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = file.name.replace(/\.[^.]+$/, '') + '_bande.png';
+            a.click();
+          }, 'image/png', 1.0);
+        };
+      };
+    } else {
+      // video -> use hidden player to seek and render frames
+      const player = document.createElement('video');
+      player.src = url;
+      player.muted = true; player.playsInline = true;
+      player.style.display = 'none';
+      document.body.appendChild(player);
+
+      player.addEventListener('loadedmetadata', () => {
+        const vw = player.videoWidth, vh = player.videoHeight;
+        const band = Math.max(1, Math.floor(vh * 0.08));
+        canvas.width = vw; canvas.height = vh + band;
+        const ctx = canvas.getContext('2d');
+
+        // live preview loop
+        let raf;
+        function liveDraw(){
+          ctx.clearRect(0,0,canvas.width,canvas.height);
+          ctx.drawImage(player, 0, 0, vw, vh);
+          ctx.fillStyle = 'white';
+          ctx.fillRect(0, vh, vw, band);
+          raf = requestAnimationFrame(liveDraw);
+        }
+        player.play().catch(()=>{}); liveDraw();
+
+        dlWithBand.disabled = false;
+        dlWithBand.onclick = async () => {
+          dlWithBand.disabled = true;
+          statusLine.textContent = 'Préparation export (frames + audio)...';
+          setGlobalStatus('Export en cours — prépare audio & frames...');
+          progBar.style.width = '2%';
+
+          try {
+            // load ffmpeg single-threaded if needed
+            if(!ffmpegLoaded){
+              statusLine.textContent = 'Chargement ffmpeg.wasm (mode single-thread, JS core)...';
+              progBar.style.width = '3%';
+              // this may take a few seconds
+              await ffmpeg.load();
+              ffmpegLoaded = true;
+            }
+
+            // write source file into ffmpeg FS
+            const ext = (file.name.match(/\.[^\.]+$/)||['.mp4'])[0];
+            const inputName = `input_${idx}${ext}`;
+            statusLine.textContent = 'Écriture du fichier source dans ffmpeg...';
+            progBar.style.width = '6%';
+            ffmpeg.FS('writeFile', inputName, await fetchFile(file));
+
+            // extract audio to AAC
+            const audioName = `audio_${idx}.aac`;
+            statusLine.textContent = 'Extraction audio (aac)...';
+            progBar.style.width = '8%';
+            // -vn removes video, result audio aac 128k
+            await ffmpeg.run('-i', inputName, '-vn', '-c:a', 'aac', '-b:a', '128k', audioName);
+
+            // prepare frames: choose fps
+            const fps = 20; // you can reduce to 15 for faster processing
+            const duration = player.duration;
+            const totalFrames = Math.max(1, Math.ceil(duration * fps));
+            statusLine.textContent = `Rendu frames (${totalFrames}) à ${fps} fps...`;
+            progBar.style.width = '12%';
+
+            // helper seek promise
+            const seekTo = (t) => new Promise(resolve => {
+              const onSeeked = () => { player.removeEventListener('seeked', onSeeked); resolve(); };
+              player.addEventListener('seeked', onSeeked);
+              player.currentTime = Math.min(t, player.duration);
+              // safety timeout
+              setTimeout(()=>{ player.removeEventListener('seeked', onSeeked); resolve(); }, 5000);
+            });
+
+            // render frames and write to FS
+            for(let i=0;i<totalFrames;i++){
+              const t = i / fps;
+              await seekTo(t);
+              ctx.clearRect(0,0,canvas.width,canvas.height);
+              ctx.drawImage(player, 0, 0, vw, vh);
+              ctx.fillStyle = 'white';
+              ctx.fillRect(0, vh, vw, band);
+              const pngBlob = await new Promise(res => canvas.toBlob(res, 'image/png'));
+              const fname = `frame_${String(i+1).padStart(6,'0')}.png`;
+              ffmpeg.FS('writeFile', fname, await fetchFile(pngBlob));
+              const pct = 12 + Math.round((i+1)/totalFrames * 60);
+              progBar.style.width = pct + '%';
+              statusLine.textContent = `Rendu frames: ${i+1}/${totalFrames}`;
+            }
+
+            // combine frames + audio into final mp4
+            statusLine.textContent = 'Transcodage final (frames + audio → MP4)...';
+            progBar.style.width = '75%';
+            const outputName = `output_${idx}.mp4`;
+            // Use libx264 + yuv420p + faststart for iPhone compatibility
+            await ffmpeg.run('-framerate', `${fps}`, '-i', 'frame_%06d.png', '-i', audioName,
+                             '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k',
+                             '-movflags', 'faststart', outputName);
+
+            progBar.style.width = '95%';
+            statusLine.textContent = 'Lecture du résultat...';
+
+            const data = ffmpeg.FS('readFile', outputName);
+            const mp4Blob = new Blob([data.buffer], { type: 'video/mp4' });
+
+            // download
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(mp4Blob);
+            a.download = file.name.replace(/\.[^.]+$/, '') + '_bande.mp4';
+            a.click();
+
+            statusLine.textContent = 'Export terminé.';
+            progBar.style.width = '100%';
+            setGlobalStatus('');
+
+            // cleanup (best-effort)
+            try {
+              ffmpeg.FS('unlink', inputName);
+              ffmpeg.FS('unlink', audioName);
+              ffmpeg.FS('unlink', outputName);
+              for(let i=0;i<totalFrames;i++){
+                const fname = `frame_${String(i+1).padStart(6,'0')}.png`;
+                try{ ffmpeg.FS('unlink', fname); } catch(e){}
+              }
+            } catch(e){}
+          } catch(err){
+            console.error(err);
+            alert('Erreur pendant l\'export : ' + (err && err.message ? err.message : err));
+            statusLine.textContent = 'Erreur pendant l\'export.';
+            setGlobalStatus('');
+          } finally {
+            dlWithBand.disabled = false;
+          }
+        }; // end onclick
+      }); // end loadedmetadata
+    }
+
+    return card;
+  } // createCard
+
+  let fileIndex = 0;
+  input.onchange = e => {
+    Array.from(e.target.files).forEach(f => preview.appendChild(createCard(f, fileIndex++)));
+    input.value = '';
+  };
+  clearBtn.onclick = () => { preview.innerHTML = ''; setGlobalStatus(''); };
+
+})(); // IIFE
+</script>
+</body>
+</html>
