@@ -29,19 +29,17 @@
     <button id="clearBtn">Effacer</button>
     <div id="globalStatus" class="status" style="margin-left:auto"></div>
   </header>
-
   <section id="preview" class="grid"></section>
 </div>
 
 <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
-
 <script>
 (async ()=> {
   const { createFFmpeg, fetchFile } = FFmpeg;
   const coreJsUrl = 'https://unpkg.com/@ffmpeg/core@0.11.6/dist/ffmpeg-core.js';
   const ffmpeg = createFFmpeg({ corePath: coreJsUrl, log: false });
-
   let ffmpegLoaded = false;
+
   const input = document.getElementById('fileInput');
   const preview = document.getElementById('preview');
   const clearBtn = document.getElementById('clearBtn');
@@ -63,7 +61,6 @@
     const card = document.createElement('article'); card.className = 'media-card';
     const inner = document.createElement('div'); inner.className = 'media-inner';
 
-    // Left: original
     let orig;
     if(isVideo){
       orig = document.createElement('video');
@@ -80,12 +77,10 @@
     }
     inner.appendChild(orig);
 
-    // Right: canvas preview
     const canvas = document.createElement('canvas');
     inner.appendChild(canvas);
     card.appendChild(inner);
 
-    // Meta + actions
     const meta = document.createElement('div'); meta.className = 'meta';
     const left = document.createElement('div');
     left.innerHTML = `<div><strong>${escapeHtml(file.name)}</strong></div>
@@ -104,7 +99,6 @@
 
     meta.appendChild(left); meta.appendChild(actions); card.appendChild(meta);
 
-    // progress UI
     const progBox = document.createElement('div');
     progBox.style.marginTop = '8px';
     progBox.innerHTML = `<div class="status small"></div><div class="progress"><i></i></div>`;
@@ -113,7 +107,6 @@
     const progBar = progBox.querySelector('.progress > i');
 
     if(!isVideo){
-      // IMAGE : Bande blanche simple
       const img = new Image();
       img.src = url;
       img.onload = () => {
@@ -134,7 +127,6 @@
         };
       };
     } else {
-      // VIDEO : Utilisation directe de ffmpeg drawbox
       const player = document.createElement('video');
       player.src = url;
       player.muted = true; player.playsInline = true;
@@ -143,63 +135,63 @@
 
       player.addEventListener('loadedmetadata', () => {
         const vw = player.videoWidth, vh = player.videoHeight;
-        const bandHeight = vh * 0.08;
-
-        // Preview dans canvas
-        canvas.width = vw;
-        canvas.height = vh;
+        const band = Math.max(1, Math.floor(vh * 0.08));
+        canvas.width = vw; canvas.height = vh + band;
         const ctx = canvas.getContext('2d');
+
+        let raf;
         function liveDraw(){
+          ctx.clearRect(0,0,canvas.width,canvas.height);
           ctx.drawImage(player, 0, 0, vw, vh);
-          requestAnimationFrame(liveDraw);
+          ctx.fillStyle = 'white';
+          ctx.fillRect(0, vh, vw, band);
+          raf = requestAnimationFrame(liveDraw);
         }
         player.play().catch(()=>{}); liveDraw();
 
         dlWithBand.disabled = false;
         dlWithBand.onclick = async () => {
           dlWithBand.disabled = true;
+          statusLine.textContent = 'Préparation export...';
           setGlobalStatus('Export en cours...');
-          statusLine.textContent = 'Chargement ffmpeg...';
-          progBar.style.width = '5%';
+          progBar.style.width = '2%';
 
           try {
             if(!ffmpegLoaded){
+              statusLine.textContent = 'Chargement ffmpeg.wasm...';
+              progBar.style.width = '3%';
               await ffmpeg.load();
               ffmpegLoaded = true;
             }
 
-            const ext = (file.name.match(/\.[^\.]+$/)||['.mp4'])[0];
-            const inputName = `input_${idx}${ext}`;
-            const outputName = `output_${idx}.mp4`;
-
-            statusLine.textContent = 'Écriture fichier source...';
-            progBar.style.width = '10%';
+            const inputName = `input_${idx}.mp4`;
             ffmpeg.FS('writeFile', inputName, await fetchFile(file));
 
-            statusLine.textContent = 'Ajout de la bande blanche...';
-            progBar.style.width = '50%';
+            const outputName = `output_${idx}.mp4`;
+            const bandHeight = Math.round(vh * 0.08);
+
             await ffmpeg.run(
               '-i', inputName,
-              '-vf', `drawbox=y=ih-${bandHeight}:color=white:width=iw:height=${bandHeight}:t=fill`,
+              '-vf', `scale='min(1280,iw)':-2,drawbox=y=ih-${bandHeight}:color=white:width=iw:height=${bandHeight}:t=fill`,
               '-c:a', 'copy',
+              '-movflags', 'faststart',
               outputName
             );
 
-            statusLine.textContent = 'Lecture résultat...';
-            progBar.style.width = '90%';
             const data = ffmpeg.FS('readFile', outputName);
             const mp4Blob = new Blob([data.buffer], { type: 'video/mp4' });
-
             const a = document.createElement('a');
             a.href = URL.createObjectURL(mp4Blob);
             a.download = file.name.replace(/\.[^.]+$/, '') + '_bande.mp4';
             a.click();
 
+            statusLine.textContent = 'Export terminé.';
             progBar.style.width = '100%';
             setGlobalStatus('');
           } catch(err){
             console.error(err);
-            alert('Erreur : ' + err.message);
+            alert('Erreur pendant l\'export : ' + (err?.message || err));
+            statusLine.textContent = 'Erreur pendant l\'export.';
             setGlobalStatus('');
           } finally {
             dlWithBand.disabled = false;
@@ -207,7 +199,6 @@
         };
       });
     }
-
     return card;
   }
 
@@ -217,6 +208,7 @@
     input.value = '';
   };
   clearBtn.onclick = () => { preview.innerHTML = ''; setGlobalStatus(''); };
+
 })();
 </script>
 </body>
