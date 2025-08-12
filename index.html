@@ -33,20 +33,15 @@
   <section id="preview" class="grid"></section>
 </div>
 
-<!-- On force le JS core (single-thread friendly). Si ton serveur bloque le CDN, remplace par ton chemin -->
 <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
 
 <script>
 (async ()=> {
   const { createFFmpeg, fetchFile } = FFmpeg;
-
-  // IMPORTANT: on essaye de forcer le JS core (non SharedArrayBuffer) en donnant corePath.
-  // Cela tend à fonctionner sans SharedArrayBuffer sur iOS, mais peut être très lent.
   const coreJsUrl = 'https://unpkg.com/@ffmpeg/core@0.11.6/dist/ffmpeg-core.js';
-  const ffmpeg = createFFmpeg({ corePath: coreJsUrl, log: false }); // single-thread friendly fallback
+  const ffmpeg = createFFmpeg({ corePath: coreJsUrl, log: false });
 
   let ffmpegLoaded = false;
-
   const input = document.getElementById('fileInput');
   const preview = document.getElementById('preview');
   const clearBtn = document.getElementById('clearBtn');
@@ -117,9 +112,8 @@
     const statusLine = progBox.querySelector('.status');
     const progBar = progBox.querySelector('.progress > i');
 
-    // Behavior
     if(!isVideo){
-      // image -> draw once
+      // IMAGE : Bande blanche simple
       const img = new Image();
       img.src = url;
       img.onload = () => {
@@ -140,7 +134,7 @@
         };
       };
     } else {
-      // video -> use hidden player to seek and render frames
+      // VIDEO : Utilisation directe de ffmpeg drawbox
       const player = document.createElement('video');
       player.src = url;
       player.muted = true; player.playsInline = true;
@@ -149,133 +143,73 @@
 
       player.addEventListener('loadedmetadata', () => {
         const vw = player.videoWidth, vh = player.videoHeight;
-        const band = Math.max(1, Math.floor(vh * 0.08));
-        canvas.width = vw; canvas.height = vh + band;
-        const ctx = canvas.getContext('2d');
+        const bandHeight = vh * 0.08;
 
-        // live preview loop
-        let raf;
+        // Preview dans canvas
+        canvas.width = vw;
+        canvas.height = vh;
+        const ctx = canvas.getContext('2d');
         function liveDraw(){
-          ctx.clearRect(0,0,canvas.width,canvas.height);
           ctx.drawImage(player, 0, 0, vw, vh);
-          ctx.fillStyle = 'white';
-          ctx.fillRect(0, vh, vw, band);
-          raf = requestAnimationFrame(liveDraw);
+          requestAnimationFrame(liveDraw);
         }
         player.play().catch(()=>{}); liveDraw();
 
         dlWithBand.disabled = false;
         dlWithBand.onclick = async () => {
           dlWithBand.disabled = true;
-          statusLine.textContent = 'Préparation export (frames + audio)...';
-          setGlobalStatus('Export en cours — prépare audio & frames...');
-          progBar.style.width = '2%';
+          setGlobalStatus('Export en cours...');
+          statusLine.textContent = 'Chargement ffmpeg...';
+          progBar.style.width = '5%';
 
           try {
-            // load ffmpeg single-threaded if needed
             if(!ffmpegLoaded){
-              statusLine.textContent = 'Chargement ffmpeg.wasm (mode single-thread, JS core)...';
-              progBar.style.width = '3%';
-              // this may take a few seconds
               await ffmpeg.load();
               ffmpegLoaded = true;
             }
 
-            // write source file into ffmpeg FS
             const ext = (file.name.match(/\.[^\.]+$/)||['.mp4'])[0];
             const inputName = `input_${idx}${ext}`;
-            statusLine.textContent = 'Écriture du fichier source dans ffmpeg...';
-            progBar.style.width = '6%';
+            const outputName = `output_${idx}.mp4`;
+
+            statusLine.textContent = 'Écriture fichier source...';
+            progBar.style.width = '10%';
             ffmpeg.FS('writeFile', inputName, await fetchFile(file));
 
-            // extract audio to AAC
-            const audioName = `audio_${idx}.aac`;
-            statusLine.textContent = 'Extraction audio (aac)...';
-            progBar.style.width = '8%';
-            // -vn removes video, result audio aac 128k
-            await ffmpeg.run('-i', inputName, '-vn', '-c:a', 'aac', '-b:a', '128k', audioName);
+            statusLine.textContent = 'Ajout de la bande blanche...';
+            progBar.style.width = '50%';
+            await ffmpeg.run(
+              '-i', inputName,
+              '-vf', `drawbox=y=ih-${bandHeight}:color=white:width=iw:height=${bandHeight}:t=fill`,
+              '-c:a', 'copy',
+              outputName
+            );
 
-            // prepare frames: choose fps
-            const fps = 20; // you can reduce to 15 for faster processing
-            const duration = player.duration;
-            const totalFrames = Math.max(1, Math.ceil(duration * fps));
-            statusLine.textContent = `Rendu frames (${totalFrames}) à ${fps} fps...`;
-            progBar.style.width = '12%';
-
-            // helper seek promise
-            const seekTo = (t) => new Promise(resolve => {
-              const onSeeked = () => { player.removeEventListener('seeked', onSeeked); resolve(); };
-              player.addEventListener('seeked', onSeeked);
-              player.currentTime = Math.min(t, player.duration);
-              // safety timeout
-              setTimeout(()=>{ player.removeEventListener('seeked', onSeeked); resolve(); }, 5000);
-            });
-
-            // render frames and write to FS
-            for(let i=0;i<totalFrames;i++){
-              const t = i / fps;
-              await seekTo(t);
-              ctx.clearRect(0,0,canvas.width,canvas.height);
-              ctx.drawImage(player, 0, 0, vw, vh);
-              ctx.fillStyle = 'white';
-              ctx.fillRect(0, vh, vw, band);
-              const pngBlob = await new Promise(res => canvas.toBlob(res, 'image/png'));
-              const fname = `frame_${String(i+1).padStart(6,'0')}.png`;
-              ffmpeg.FS('writeFile', fname, await fetchFile(pngBlob));
-              const pct = 12 + Math.round((i+1)/totalFrames * 60);
-              progBar.style.width = pct + '%';
-              statusLine.textContent = `Rendu frames: ${i+1}/${totalFrames}`;
-            }
-
-            // combine frames + audio into final mp4
-            statusLine.textContent = 'Transcodage final (frames + audio → MP4)...';
-            progBar.style.width = '75%';
-            const outputName = `output_${idx}.mp4`;
-            // Use libx264 + yuv420p + faststart for iPhone compatibility
-            await ffmpeg.run('-framerate', `${fps}`, '-i', 'frame_%06d.png', '-i', audioName,
-                             '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k',
-                             '-movflags', 'faststart', outputName);
-
-            progBar.style.width = '95%';
-            statusLine.textContent = 'Lecture du résultat...';
-
+            statusLine.textContent = 'Lecture résultat...';
+            progBar.style.width = '90%';
             const data = ffmpeg.FS('readFile', outputName);
             const mp4Blob = new Blob([data.buffer], { type: 'video/mp4' });
 
-            // download
             const a = document.createElement('a');
             a.href = URL.createObjectURL(mp4Blob);
             a.download = file.name.replace(/\.[^.]+$/, '') + '_bande.mp4';
             a.click();
 
-            statusLine.textContent = 'Export terminé.';
             progBar.style.width = '100%';
             setGlobalStatus('');
-
-            // cleanup (best-effort)
-            try {
-              ffmpeg.FS('unlink', inputName);
-              ffmpeg.FS('unlink', audioName);
-              ffmpeg.FS('unlink', outputName);
-              for(let i=0;i<totalFrames;i++){
-                const fname = `frame_${String(i+1).padStart(6,'0')}.png`;
-                try{ ffmpeg.FS('unlink', fname); } catch(e){}
-              }
-            } catch(e){}
           } catch(err){
             console.error(err);
-            alert('Erreur pendant l\'export : ' + (err && err.message ? err.message : err));
-            statusLine.textContent = 'Erreur pendant l\'export.';
+            alert('Erreur : ' + err.message);
             setGlobalStatus('');
           } finally {
             dlWithBand.disabled = false;
           }
-        }; // end onclick
-      }); // end loadedmetadata
+        };
+      });
     }
 
     return card;
-  } // createCard
+  }
 
   let fileIndex = 0;
   input.onchange = e => {
@@ -283,8 +217,7 @@
     input.value = '';
   };
   clearBtn.onclick = () => { preview.innerHTML = ''; setGlobalStatus(''); };
-
-})(); // IIFE
+})();
 </script>
 </body>
 </html>
